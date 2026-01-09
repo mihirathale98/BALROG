@@ -76,3 +76,26 @@ def get_instruction_prompt(env, task=None):
     instruction_prompt = intruction_prompts[task].strip()
 
     return instruction_prompt
+
+
+def get_instruction_prompt_with_plan(task: str, plan: str | None = None) -> str:
+    """Get the instruction prompt for a task, optionally augmented with a plan.
+
+    Args:
+        task: The TextWorld task name (treasure_hunter, the_cooking_game, coin_collector)
+        plan: Optional high-level strategy/plan to inject into the prompt
+
+    Returns:
+        The instruction prompt, optionally augmented with the plan
+    """
+    instruction = intruction_prompts[task].strip()
+
+    if plan:
+        instruction += f"""
+
+STRATEGY TO FOLLOW:
+{plan}
+
+Follow this strategy while playing the game. Adapt as needed based on what you observe."""
+
+    return instruction
