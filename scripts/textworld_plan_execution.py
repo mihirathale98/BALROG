@@ -230,10 +230,22 @@ async def main_async(args):
     load_dotenv()
 
     # Determine API key
-    api_key = args.api_key or os.getenv("OPENAI_API_KEY")
+    if args.local:
+        api_key = "NO_API_KEY"
+        os.environ["OPENAI_API_KEY"] = api_key
+    elif args.api_key:
+        api_key = args.api_key
+        os.environ["OPENAI_API_KEY"] = api_key
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            # Set dummy key for local endpoints
+            api_key = "NO_API_KEY"
+            os.environ["OPENAI_API_KEY"] = api_key
 
     print(f"Base URL: {args.base_url}")
     print(f"Model: {args.model}")
+    print(f"Local mode: {args.local}")
     print(f"Max concurrency: {args.max_concurrency}")
 
     # Load plans
@@ -398,6 +410,11 @@ def main():
         type=str,
         default="http://localhost:8080/v1",
         help="API base URL",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Use local endpoint (sets api_key to NO_API_KEY)",
     )
     parser.add_argument(
         "--api-key",
