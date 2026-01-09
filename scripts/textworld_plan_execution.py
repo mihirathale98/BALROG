@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """
-Plan Execution Script for TextWorld Tasks.
+Plan Execution Script for TextWorld Game Instances.
 
 Takes a JSONL file with generated plans (from textworld_plan_generation.py) and runs
-BALROG episodes guided by each plan at different budget levels.
+BALROG episodes guided by each plan. Each plan is matched with its original game
+instance using the same seed.
 
 Usage:
     # Basic usage
@@ -233,13 +234,6 @@ def main():
         help="API key (default: from OPENAI_API_KEY env var)",
     )
 
-    # Execution arguments
-    parser.add_argument(
-        "--episodes-per-plan",
-        type=int,
-        default=3,
-        help="Number of episodes to run per plan",
-    )
     parser.add_argument(
         "--temperature",
         type=float,
@@ -318,83 +312,85 @@ def main():
         print(f"Loading existing results from {output_path}...")
         existing_df = pd.read_json(output_path, orient="records", lines=True)
         existing_results = existing_df.to_dict("records")
-        # Create set of completed (task, budget, episode) tuples
-        completed = {(r["task"], r["budget"], r["episode_idx"]) for r in existing_results}
+        # Create set of completed (task, seed, budget) tuples
+        completed = {(r["task"], r["seed"], r["budget"]) for r in existing_results}
     else:
         completed = set()
 
-    # Run episodes
+    # Run episodes - each plan row has a specific seed from plan generation
     results = existing_results.copy()
-    total_runs = len(tasks) * len(budgets) * args.episodes_per_plan
+
+    # Count total runs: each row in plans_df has a (task, seed) pair
+    # For each row, we run len(budgets) episodes (one per budget level)
+    filtered_plans = plans_df[plans_df["task"].isin(tasks)]
+    total_runs = len(filtered_plans) * len(budgets)
     skipped = 0
 
     with tqdm(total=total_runs, desc="Running episodes") as pbar:
-        for _, row in plans_df.iterrows():
+        for _, row in filtered_plans.iterrows():
             task = row["task"]
-            if task not in tasks:
-                pbar.update(len(budgets) * args.episodes_per_plan)
-                continue
+            seed = row["seed"]  # Use the same seed from plan generation
 
             for budget in budgets:
                 plan_col = f"bo{budget}_plan"
                 if plan_col not in row:
-                    pbar.update(args.episodes_per_plan)
+                    pbar.update(1)
                     continue
 
                 plan = row[plan_col]
 
-                for episode_idx in range(args.episodes_per_plan):
-                    # Skip if already completed
-                    if (task, budget, episode_idx) in completed:
-                        skipped += 1
-                        pbar.update(1)
-                        continue
-
-                    try:
-                        episode_log = run_episode_with_plan(
-                            task=task,
-                            plan=plan,
-                            config=config,
-                            agent_factory=agent_factory,
-                            episode_idx=episode_idx,
-                        )
-
-                        result = {
-                            "task": task,
-                            "budget": budget,
-                            "episode_idx": episode_idx,
-                            "plan": plan,
-                            "episode_return": episode_log["episode_return"],
-                            "num_steps": episode_log["num_steps"],
-                            "done": episode_log["done"],
-                            "won": episode_log["won"],
-                            "seed": episode_log["seed"],
-                        }
-                        results.append(result)
-
-                        # Save incrementally
-                        df = pd.DataFrame(results)
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        df.to_json(output_path, orient="records", lines=True)
-
-                        pbar.set_postfix({
-                            "task": task,
-                            "budget": budget,
-                            "return": f"{episode_log['episode_return']:.1f}",
-                            "won": episode_log["won"],
-                        })
-
-                    except Exception as e:
-                        print(f"\nError running {task} bo{budget} ep{episode_idx}: {e}")
-                        results.append({
-                            "task": task,
-                            "budget": budget,
-                            "episode_idx": episode_idx,
-                            "plan": plan,
-                            "error": str(e),
-                        })
-
+                # Skip if already completed (keyed by task, seed, budget)
+                if (task, seed, budget) in completed:
+                    skipped += 1
                     pbar.update(1)
+                    continue
+
+                try:
+                    episode_log = run_episode_with_plan(
+                        task=task,
+                        plan=plan,
+                        config=config,
+                        agent_factory=agent_factory,
+                        episode_idx=0,
+                        seed=seed,  # Use the same seed as plan generation
+                    )
+
+                    result = {
+                        "task": task,
+                        "seed": seed,
+                        "budget": budget,
+                        "plan": plan,
+                        "episode_return": episode_log["episode_return"],
+                        "num_steps": episode_log["num_steps"],
+                        "done": episode_log["done"],
+                        "won": episode_log["won"],
+                    }
+                    results.append(result)
+
+                    # Save incrementally
+                    df = pd.DataFrame(results)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    df.to_json(output_path, orient="records", lines=True)
+
+                    pbar.set_postfix({
+                        "task": task[:10],
+                        "seed": seed,
+                        "bo": budget,
+                        "ret": f"{episode_log['episode_return']:.1f}",
+                        "won": episode_log["won"],
+                    })
+
+                except Exception as e:
+                    print(f"\nError running {task} seed={seed} bo{budget}: {e}")
+                    results.append({
+                        "task": task,
+                        "seed": seed,
+                        "budget": budget,
+                        "plan": plan,
+                        "error": str(e),
+                    })
+
+                pbar.update(1)
 
     if skipped > 0:
         print(f"\nSkipped {skipped} already completed episodes")
@@ -405,10 +401,11 @@ def main():
 
     # Compute and print summary
     print("\n" + "=" * 60)
-    print("EXECUTION SUMMARY")
+    print("EXECUTION SUMMARY (per task, aggregated across seeds)")
     print("=" * 60)
 
-    df_valid = df[~df.get("error", pd.Series([None] * len(df))).notna() | (df.get("error", pd.Series([None] * len(df))).isna())]
+    # Filter out errors
+    df_valid = df[~df.get("error", pd.Series([None] * len(df))).notna()]
 
     for task in tasks:
         task_df = df_valid[df_valid["task"] == task]
@@ -421,16 +418,16 @@ def main():
             if len(budget_df) == 0:
                 continue
 
-            win_rate = budget_df["won"].mean() if "won" in budget_df else 0
-            avg_return = budget_df["episode_return"].mean() if "episode_return" in budget_df else 0
-            best_return = budget_df["episode_return"].max() if "episode_return" in budget_df else 0
-            n_episodes = len(budget_df)
+            win_rate = budget_df["won"].mean() if "won" in budget_df.columns else 0
+            avg_return = budget_df["episode_return"].mean() if "episode_return" in budget_df.columns else 0
+            n_instances = len(budget_df)
+            n_wins = budget_df["won"].sum() if "won" in budget_df.columns else 0
 
-            print(f"  bo{budget}: win_rate={win_rate:.2%} avg_return={avg_return:.2f} best_return={best_return:.2f} (n={n_episodes})")
+            print(f"  bo{budget}: win_rate={win_rate:.2%} ({int(n_wins)}/{n_instances}) avg_return={avg_return:.2f}")
 
-    # Best-of-N analysis
+    # Per-seed breakdown
     print("\n" + "=" * 60)
-    print("BEST-OF-N ANALYSIS (best episode per task/budget)")
+    print("PER-INSTANCE RESULTS (by seed)")
     print("=" * 60)
 
     for task in tasks:
@@ -438,19 +435,19 @@ def main():
         if len(task_df) == 0:
             continue
 
+        seeds = task_df["seed"].unique()
         print(f"\n{task}:")
-        for budget in budgets:
-            budget_df = task_df[task_df["budget"] == budget]
-            if len(budget_df) == 0:
-                continue
-
-            # Best of all episodes for this budget
-            best_idx = budget_df["episode_return"].idxmax()
-            best_row = budget_df.loc[best_idx]
-            best_won = best_row.get("won", False)
-            best_return = best_row["episode_return"]
-
-            print(f"  bo{budget}: won={best_won} best_return={best_return:.2f}")
+        for seed in sorted(seeds):
+            seed_df = task_df[task_df["seed"] == seed]
+            print(f"  seed={seed}:")
+            for budget in budgets:
+                budget_df = seed_df[seed_df["budget"] == budget]
+                if len(budget_df) == 0:
+                    continue
+                row = budget_df.iloc[0]
+                won = row.get("won", False)
+                ret = row.get("episode_return", 0)
+                print(f"    bo{budget}: won={won} return={ret:.1f}")
 
     print(f"\nResults saved to {output_path}")
 

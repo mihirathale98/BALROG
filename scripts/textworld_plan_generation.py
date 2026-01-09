@@ -1,34 +1,42 @@
 #!/usr/bin/env python
 """
-Plan Generation Script for TextWorld Tasks.
+Plan Generation Script for TextWorld Game Instances.
 
-Generates N high-level game-solving plans for each TextWorld task using BestOfN,
-then saves the best plan at each budget level.
+For each TextWorld task, creates multiple game instances (with different seeds),
+gets the initial observation, and generates N plans based on that specific game state.
 
 Usage:
     # OpenAI API
-    python scripts/textworld_plan_generation.py --n-plans 8 --output results/textworld_plans.jsonl
+    python scripts/textworld_plan_generation.py --n-plans 8 --n-instances 5 \
+        --output results/textworld_plans.jsonl
 
     # Local vLLM endpoint
     python scripts/textworld_plan_generation.py --local --endpoint http://localhost:8000/v1 \
-        --model qwen2.5-72b-instruct --n-plans 8
+        --model qwen2.5-72b-instruct --n-plans 8 --n-instances 5
 """
 
 import argparse
 import os
+import random
 import sys
 from pathlib import Path
 
+import numpy as np
 from dotenv import load_dotenv
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
-# Add its_hub to path
+# Add paths
+sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "its_hub"))
 
 from its_hub.algorithms import BestOfN
 from its_hub.integration.reward_hub import LLMJudgeRewardModel
 from its_hub.lms import OpenAICompatibleLanguageModel
 from its_hub.utils import extract_content_from_lm_response
+
+from balrog.environments import make_env
+from balrog.environments.textworld import intruction_prompts
 
 import litellm
 import pandas as pd
@@ -39,66 +47,23 @@ litellm.drop_params = True
 # Plan generation system prompt for TextWorld
 PLAN_GENERATION_SYSTEM_PROMPT = """You are a strategic planner for text adventure games.
 
-When given a game description, provide ONLY a high-level strategy or plan to solve the game.
-Do NOT provide specific commands - describe the logical approach.
+You will be given:
+1. The game rules and available commands
+2. The initial observation showing your starting location and surroundings
 
-Your plan should include:
-1. Key objectives to accomplish
-2. The sequence of steps to take (explore, find items, solve puzzles)
-3. How to handle common obstacles (locked doors, hidden items, etc.)
+Based on this information, create a step-by-step strategy to solve the game.
+Focus on:
+- What to explore first
+- What items to look for and collect
+- How to handle obstacles (locked doors, containers, etc.)
+- The sequence of actions to achieve the goal
 
-Keep the plan concise and focused on strategy, not specific game commands."""
-
-
-# TextWorld task descriptions (matching balrog/environments/textworld/__init__.py)
-TEXTWORLD_TASKS = {
-    "treasure_hunter": """
-TextWorld: Treasure Hunter
-
-You are in a randomly generated maze with multiple rooms. Your goal is to find a specific treasure object.
-
-Key mechanics:
-- Explore different rooms using directional commands
-- Look for keys to unlock locked doors and containers
-- Keys match locks by their adjective (e.g., "non-euclidean keycard" matches "non-euclidean safe")
-- Containers may hold the target object or keys
-- You must unlock, then open locked doors/containers
-
-You have 40 steps to find and obtain the treasure.
-""",
-    "the_cooking_game": """
-TextWorld: The Cooking Game
-
-You navigate through rooms to find ingredients, prepare food according to a recipe, and eat the meal.
-
-Key mechanics:
-- Find and examine the cookbook to see the recipe
-- Gather ingredients from various rooms
-- Process ingredients: slice/chop/dice with a knife (take both knife and ingredient first)
-- Cook ingredients: BBQ=grill, stove=fry, oven=roast (ingredient must be in inventory, tool in room)
-- Process before cooking (e.g., slice then fry)
-- Prepare meal in kitchen when all ingredients ready, then eat meal
-
-You have 80 steps to complete the task.
-""",
-    "coin_collector": """
-TextWorld: Coin Collector
-
-You are in a randomly generated maze. Your goal is to find and collect a coin.
-
-Key mechanics:
-- Navigate rooms using directional commands (go north/south/east/west)
-- Explore until you find the coin
-- Take the coin when you see it
-
-You have 25 steps to find the coin.
-""",
-}
+Be specific to what you observe in the game, not generic advice."""
 
 
 def get_power_of_2_budgets(n: int) -> list[int]:
     """Get all powers of 2 from 1 up to n."""
-    budgets = [1]  # Include 1 for baseline
+    budgets = [1]
     power = 1
     while 2**power <= n:
         budgets.append(2**power)
@@ -106,10 +71,51 @@ def get_power_of_2_budgets(n: int) -> list[int]:
     return budgets
 
 
+def create_config():
+    """Create a minimal BALROG config for environment creation."""
+    return OmegaConf.create({
+        "envs": {
+            "names": "textworld",
+            "env_kwargs": {"seed": None},
+            "textworld_kwargs": {
+                "objective": True,
+                "description": True,
+                "score": True,
+                "max_score": True,
+                "won": True,
+                "max_episode_steps": 80,
+                "textworld_games_path": "tw_games",
+            },
+        },
+        "tasks": {
+            "textworld_tasks": ["treasure_hunter", "the_cooking_game", "coin_collector"],
+        },
+    })
+
+
+def get_initial_observation(task: str, seed: int, config) -> dict:
+    """Get the initial observation from a TextWorld game instance."""
+    env = make_env("textworld", task, config)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    obs, info = env.reset(seed=seed)
+
+    # Extract text observation
+    long_term = obs["text"].get("long_term_context", "")
+    short_term = obs["text"].get("short_term_context", "")
+
+    return {
+        "long_term_context": long_term,
+        "short_term_context": short_term,
+        "full_observation": f"{long_term}\n\n{short_term}".strip(),
+    }
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Generate plans for TextWorld tasks using Best-of-N"
+        description="Generate plans for TextWorld game instances using Best-of-N"
     )
 
     # Model arguments
@@ -148,7 +154,19 @@ def main():
         "--n-plans",
         type=int,
         default=8,
-        help="Number of plans to generate per task",
+        help="Number of plans to generate per game instance",
+    )
+    parser.add_argument(
+        "--n-instances",
+        type=int,
+        default=10,
+        help="Number of game instances (seeds) per task (default matches BALROG baseline)",
+    )
+    parser.add_argument(
+        "--start-seed",
+        type=int,
+        default=42,
+        help="Starting seed for game instances",
     )
     parser.add_argument(
         "--temperature",
@@ -174,7 +192,7 @@ def main():
         "--tasks",
         type=str,
         nargs="+",
-        default=list(TEXTWORLD_TASKS.keys()),
+        default=["treasure_hunter", "the_cooking_game", "coin_collector"],
         help="TextWorld tasks to generate plans for",
     )
 
@@ -211,6 +229,8 @@ def main():
     print(f"Judge model: {judge_model}")
     print(f"Local mode: {args.local}")
     print(f"Tasks: {args.tasks}")
+    print(f"Instances per task: {args.n_instances}")
+    print(f"Plans per instance: {args.n_plans}")
 
     # Set up LM for plan generation
     plan_lm = OpenAICompatibleLanguageModel(
@@ -236,49 +256,71 @@ def main():
     bon = BestOfN(orm=plan_critic)
 
     budgets = get_power_of_2_budgets(args.n_plans)
-    print(f"Processing {len(args.tasks)} tasks, {args.n_plans} plans each")
+    total_instances = len(args.tasks) * args.n_instances
+    print(f"Total game instances: {total_instances}")
     print(f"Budget levels: {budgets}")
 
+    # Create BALROG config for environment
+    config = create_config()
+
     results = []
-    for task in tqdm(args.tasks, desc="Tasks"):
-        task_description = TEXTWORLD_TASKS[task]
+    seeds = list(range(args.start_seed, args.start_seed + args.n_instances))
 
-        # Prompt for plan generation
-        prompt = f"""Generate a step-by-step strategy to solve this text adventure game:
+    for task in args.tasks:
+        task_instruction = intruction_prompts[task].strip()
 
-{task_description}
+        for seed in tqdm(seeds, desc=f"Task: {task}"):
+            # Get initial observation from this game instance
+            try:
+                obs = get_initial_observation(task, seed, config)
+            except Exception as e:
+                print(f"\nError getting observation for {task} seed={seed}: {e}")
+                continue
 
-Provide a clear, actionable plan that will help an agent complete this game efficiently."""
+            # Create prompt with game rules + initial observation
+            prompt = f"""GAME RULES AND COMMANDS:
+{task_instruction}
 
-        # Generate all N plans and score them in one call
-        result = bon.infer(
-            plan_lm, prompt, budget=args.n_plans, return_response_only=False
-        )
+INITIAL OBSERVATION:
+{obs['full_observation']}
 
-        plans = [extract_content_from_lm_response(r) for r in result.responses]
-        scores = result.scores
+Based on what you see in this specific game, create a detailed step-by-step strategy to win.
+Consider the rooms, exits, and objects mentioned in the observation."""
 
-        result_row = {
-            "task": task,
-            "task_description": task_description.strip(),
-            "all_plans": plans,
-            "all_scores": scores,
-        }
+            # Generate all N plans and score them
+            try:
+                result = bon.infer(
+                    plan_lm, prompt, budget=args.n_plans, return_response_only=False
+                )
 
-        # Simulate each budget level from the same N plans
-        for budget in budgets:
-            subset_scores = scores[:budget]
-            best_idx = subset_scores.index(max(subset_scores))
-            result_row[f"bo{budget}_plan"] = plans[best_idx]
-            result_row[f"bo{budget}_plan_score"] = scores[best_idx]
+                plans = [extract_content_from_lm_response(r) for r in result.responses]
+                scores = result.scores
 
-        results.append(result_row)
+                result_row = {
+                    "task": task,
+                    "seed": seed,
+                    "initial_observation": obs['full_observation'],
+                    "task_instruction": task_instruction,
+                    "all_plans": plans,
+                    "all_scores": scores,
+                }
 
-        # Print best plan for this task
-        best_overall_idx = scores.index(max(scores))
-        print(f"\n{task}: Best plan (score={scores[best_overall_idx]:.2f}):")
-        print("-" * 40)
-        print(plans[best_overall_idx][:500] + "..." if len(plans[best_overall_idx]) > 500 else plans[best_overall_idx])
+                # Save best plan at each budget level
+                for budget in budgets:
+                    subset_scores = scores[:budget]
+                    best_idx = subset_scores.index(max(subset_scores))
+                    result_row[f"bo{budget}_plan"] = plans[best_idx]
+                    result_row[f"bo{budget}_plan_score"] = scores[best_idx]
+
+                results.append(result_row)
+
+                # Print summary
+                best_score = max(scores)
+                print(f"  seed={seed}: best_score={best_score:.2f}")
+
+            except Exception as e:
+                print(f"\nError generating plans for {task} seed={seed}: {e}")
+                continue
 
     # Save results
     output_path = Path(args.output)
@@ -286,17 +328,18 @@ Provide a clear, actionable plan that will help an agent complete this game effi
 
     df = pd.DataFrame(results)
     df.to_json(output_path, orient="records", lines=True)
-    print(f"\nSaved {len(results)} task plans to {output_path}")
+    print(f"\nSaved {len(results)} game instance plans to {output_path}")
 
     # Summary
     print("\n" + "=" * 60)
     print("PLAN GENERATION SUMMARY")
     print("=" * 60)
-    for row in results:
-        print(f"\n{row['task']}:")
+    for task in args.tasks:
+        task_results = [r for r in results if r["task"] == task]
+        print(f"\n{task}: {len(task_results)} instances")
         for budget in budgets:
-            score = row[f"bo{budget}_plan_score"]
-            print(f"  bo{budget}: score={score:.3f}")
+            avg_score = np.mean([r[f"bo{budget}_plan_score"] for r in task_results]) if task_results else 0
+            print(f"  bo{budget}: avg_score={avg_score:.3f}")
 
 
 if __name__ == "__main__":

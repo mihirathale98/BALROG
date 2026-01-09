@@ -39,7 +39,7 @@ client:
   alternate_roles: False        # Whether the client requires alternating between the agent and the environment
 
 envs:
-  names: babyai-babaisai-textworld-crafter-nle-minihack   # Environments to evaluate, separated by hyphens
+  names: textworld   # Environments to evaluate, separated by hyphens
   env_kwargs:
     seed: null                # Random seed; null means a random seed is used
   nle_kwargs:
