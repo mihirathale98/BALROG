@@ -1,21 +1,20 @@
 #!/usr/bin/env python
 """
-Plan Generation Script for TextWorld Game Instances.
+Plan Generation Script for TextWorld Game Instances (Async).
 
 For each TextWorld task, creates multiple game instances (with different seeds),
 gets the initial observation, and generates N plans based on that specific game state.
 
-Usage:
-    # OpenAI API
-    python scripts/textworld_plan_generation.py --n-plans 8 --n-instances 5 \
-        --output results/textworld_plans.jsonl
+Uses async generation for efficient vLLM utilization.
 
+Usage:
     # Local vLLM endpoint
     python scripts/textworld_plan_generation.py --local --endpoint http://localhost:8000/v1 \
-        --model qwen2.5-72b-instruct --n-plans 8 --n-instances 5
+        --model Qwen/Qwen3-4B-Instruct-2507 --n-plans 8 --n-instances 10
 """
 
 import argparse
+import asyncio
 import os
 import random
 import sys
@@ -24,7 +23,7 @@ from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
 from omegaconf import OmegaConf
-from tqdm import tqdm
+from tqdm.asyncio import tqdm
 
 # Add paths
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -112,10 +111,187 @@ def get_initial_observation(task: str, seed: int, config) -> dict:
     }
 
 
+async def generate_plans_for_instance(
+    task: str,
+    seed: int,
+    obs: dict,
+    task_instruction: str,
+    bon: BestOfN,
+    plan_lm: OpenAICompatibleLanguageModel,
+    n_plans: int,
+    budgets: list[int],
+) -> dict:
+    """Generate plans for a single game instance asynchronously."""
+    prompt = f"""GAME RULES AND COMMANDS:
+{task_instruction}
+
+INITIAL OBSERVATION:
+{obs['full_observation']}
+
+Based on what you see in this specific game, create a detailed step-by-step strategy to win.
+Consider the rooms, exits, and objects mentioned in the observation."""
+
+    # Generate all N plans and score them
+    result = await bon.ainfer(
+        plan_lm, prompt, budget=n_plans, return_response_only=False
+    )
+
+    plans = [extract_content_from_lm_response(r) for r in result.responses]
+    scores = result.scores
+
+    result_row = {
+        "task": task,
+        "seed": seed,
+        "initial_observation": obs['full_observation'],
+        "task_instruction": task_instruction,
+        "all_plans": plans,
+        "all_scores": scores,
+    }
+
+    # Save best plan at each budget level
+    for budget in budgets:
+        subset_scores = scores[:budget]
+        best_idx = subset_scores.index(max(subset_scores))
+        result_row[f"bo{budget}_plan"] = plans[best_idx]
+        result_row[f"bo{budget}_plan_score"] = scores[best_idx]
+
+    return result_row
+
+
+async def main_async(args):
+    """Async main function."""
+    load_dotenv()
+
+    # Determine API key
+    if args.local:
+        api_key = "NO_API_KEY"
+    elif args.api_key:
+        api_key = args.api_key
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key and not args.local:
+        raise ValueError(
+            "API key required. Set OPENAI_API_KEY or use --api-key or --local"
+        )
+
+    # Default judge model to same as generation model
+    judge_model = args.judge_model or args.model
+
+    print(f"Endpoint: {args.endpoint}")
+    print(f"Model: {args.model}")
+    print(f"Judge model: {judge_model}")
+    print(f"Local mode: {args.local}")
+    print(f"Tasks: {args.tasks}")
+    print(f"Instances per task: {args.n_instances}")
+    print(f"Plans per instance: {args.n_plans}")
+    print(f"Max concurrency: {args.max_concurrency}")
+
+    # Set up LM for plan generation (async mode)
+    plan_lm = OpenAICompatibleLanguageModel(
+        endpoint=args.endpoint,
+        api_key=api_key,
+        model_name=args.model,
+        system_prompt=PLAN_GENERATION_SYSTEM_PROMPT,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        max_concurrency=args.max_concurrency,
+        is_async=True,
+    )
+
+    # Set up LLM judge as plan critic
+    plan_critic = LLMJudgeRewardModel(
+        model=judge_model,
+        criterion="overall_quality",
+        judge_type="pointwise",
+        api_key=api_key,
+        base_url=args.endpoint if args.local else None,
+        temperature=0.0,
+    )
+
+    bon = BestOfN(orm=plan_critic)
+
+    budgets = get_power_of_2_budgets(args.n_plans)
+    total_instances = len(args.tasks) * args.n_instances
+    print(f"Total game instances: {total_instances}")
+    print(f"Budget levels: {budgets}")
+
+    # Create BALROG config for environment
+    config = create_config()
+
+    # Prepare all instances
+    instances = []
+    seeds = list(range(args.start_seed, args.start_seed + args.n_instances))
+
+    print("\nCollecting initial observations...")
+    for task in args.tasks:
+        task_instruction = intruction_prompts[task].strip()
+        for seed in seeds:
+            try:
+                obs = get_initial_observation(task, seed, config)
+                instances.append({
+                    "task": task,
+                    "seed": seed,
+                    "obs": obs,
+                    "task_instruction": task_instruction,
+                })
+            except Exception as e:
+                print(f"Error getting observation for {task} seed={seed}: {e}")
+
+    print(f"Collected {len(instances)} instances")
+
+    # Generate plans concurrently with semaphore for rate limiting
+    semaphore = asyncio.Semaphore(args.max_concurrency)
+
+    async def generate_with_semaphore(instance):
+        async with semaphore:
+            try:
+                return await generate_plans_for_instance(
+                    task=instance["task"],
+                    seed=instance["seed"],
+                    obs=instance["obs"],
+                    task_instruction=instance["task_instruction"],
+                    bon=bon,
+                    plan_lm=plan_lm,
+                    n_plans=args.n_plans,
+                    budgets=budgets,
+                )
+            except Exception as e:
+                print(f"\nError generating plans for {instance['task']} seed={instance['seed']}: {e}")
+                return None
+
+    print("\nGenerating plans asynchronously...")
+    tasks = [generate_with_semaphore(inst) for inst in instances]
+    results = await tqdm.gather(*tasks, desc="Generating plans")
+
+    # Filter out None results
+    results = [r for r in results if r is not None]
+
+    # Save results
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame(results)
+    df.to_json(output_path, orient="records", lines=True)
+    print(f"\nSaved {len(results)} game instance plans to {output_path}")
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("PLAN GENERATION SUMMARY")
+    print("=" * 60)
+    for task in args.tasks:
+        task_results = [r for r in results if r["task"] == task]
+        print(f"\n{task}: {len(task_results)} instances")
+        for budget in budgets:
+            if task_results:
+                avg_score = np.mean([r[f"bo{budget}_plan_score"] for r in task_results])
+                print(f"  bo{budget}: avg_score={avg_score:.3f}")
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Generate plans for TextWorld game instances using Best-of-N"
+        description="Generate plans for TextWorld game instances using Best-of-N (async)"
     )
 
     # Model arguments
@@ -183,7 +359,7 @@ def main():
     parser.add_argument(
         "--max-concurrency",
         type=int,
-        default=16,
+        default=32,
         help="Max concurrent API requests",
     )
 
@@ -206,140 +382,8 @@ def main():
 
     args = parser.parse_args()
 
-    load_dotenv()
-
-    # Determine API key
-    if args.local:
-        api_key = "NO_API_KEY"
-    elif args.api_key:
-        api_key = args.api_key
-    else:
-        api_key = os.getenv("OPENAI_API_KEY")
-
-    if not api_key and not args.local:
-        raise ValueError(
-            "API key required. Set OPENAI_API_KEY or use --api-key or --local"
-        )
-
-    # Default judge model to same as generation model
-    judge_model = args.judge_model or args.model
-
-    print(f"Endpoint: {args.endpoint}")
-    print(f"Model: {args.model}")
-    print(f"Judge model: {judge_model}")
-    print(f"Local mode: {args.local}")
-    print(f"Tasks: {args.tasks}")
-    print(f"Instances per task: {args.n_instances}")
-    print(f"Plans per instance: {args.n_plans}")
-
-    # Set up LM for plan generation
-    plan_lm = OpenAICompatibleLanguageModel(
-        endpoint=args.endpoint,
-        api_key=api_key,
-        model_name=args.model,
-        system_prompt=PLAN_GENERATION_SYSTEM_PROMPT,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        max_concurrency=args.max_concurrency,
-    )
-
-    # Set up LLM judge as plan critic
-    plan_critic = LLMJudgeRewardModel(
-        model=judge_model,
-        criterion="overall_quality",
-        judge_type="pointwise",
-        api_key=api_key,
-        base_url=args.endpoint if args.local else None,
-        temperature=0.0,
-    )
-
-    bon = BestOfN(orm=plan_critic)
-
-    budgets = get_power_of_2_budgets(args.n_plans)
-    total_instances = len(args.tasks) * args.n_instances
-    print(f"Total game instances: {total_instances}")
-    print(f"Budget levels: {budgets}")
-
-    # Create BALROG config for environment
-    config = create_config()
-
-    results = []
-    seeds = list(range(args.start_seed, args.start_seed + args.n_instances))
-
-    for task in args.tasks:
-        task_instruction = intruction_prompts[task].strip()
-
-        for seed in tqdm(seeds, desc=f"Task: {task}"):
-            # Get initial observation from this game instance
-            try:
-                obs = get_initial_observation(task, seed, config)
-            except Exception as e:
-                print(f"\nError getting observation for {task} seed={seed}: {e}")
-                continue
-
-            # Create prompt with game rules + initial observation
-            prompt = f"""GAME RULES AND COMMANDS:
-{task_instruction}
-
-INITIAL OBSERVATION:
-{obs['full_observation']}
-
-Based on what you see in this specific game, create a detailed step-by-step strategy to win.
-Consider the rooms, exits, and objects mentioned in the observation."""
-
-            # Generate all N plans and score them
-            try:
-                result = bon.infer(
-                    plan_lm, prompt, budget=args.n_plans, return_response_only=False
-                )
-
-                plans = [extract_content_from_lm_response(r) for r in result.responses]
-                scores = result.scores
-
-                result_row = {
-                    "task": task,
-                    "seed": seed,
-                    "initial_observation": obs['full_observation'],
-                    "task_instruction": task_instruction,
-                    "all_plans": plans,
-                    "all_scores": scores,
-                }
-
-                # Save best plan at each budget level
-                for budget in budgets:
-                    subset_scores = scores[:budget]
-                    best_idx = subset_scores.index(max(subset_scores))
-                    result_row[f"bo{budget}_plan"] = plans[best_idx]
-                    result_row[f"bo{budget}_plan_score"] = scores[best_idx]
-
-                results.append(result_row)
-
-                # Print summary
-                best_score = max(scores)
-                print(f"  seed={seed}: best_score={best_score:.2f}")
-
-            except Exception as e:
-                print(f"\nError generating plans for {task} seed={seed}: {e}")
-                continue
-
-    # Save results
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    df = pd.DataFrame(results)
-    df.to_json(output_path, orient="records", lines=True)
-    print(f"\nSaved {len(results)} game instance plans to {output_path}")
-
-    # Summary
-    print("\n" + "=" * 60)
-    print("PLAN GENERATION SUMMARY")
-    print("=" * 60)
-    for task in args.tasks:
-        task_results = [r for r in results if r["task"] == task]
-        print(f"\n{task}: {len(task_results)} instances")
-        for budget in budgets:
-            avg_score = np.mean([r[f"bo{budget}_plan_score"] for r in task_results]) if task_results else 0
-            print(f"  bo{budget}: avg_score={avg_score:.3f}")
+    # Run async main
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":
