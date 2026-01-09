@@ -52,11 +52,15 @@ def get_power_of_2_budgets(n: int) -> list[int]:
 def create_config(
     model_id: str,
     base_url: str,
+    local: bool = False,
     api_key: str | None = None,
     temperature: float = 1.0,
     max_tokens: int = 4096,
 ):
     """Create a BALROG-compatible config."""
+    # Use vllm client for local endpoints
+    client_name = "vllm" if local else "openai"
+
     config = OmegaConf.create({
         "agent": {
             "type": "naive",
@@ -80,7 +84,7 @@ def create_config(
             "feedback_on_invalid_action": True,
         },
         "client": {
-            "client_name": "openai",
+            "client_name": client_name,
             "model_id": model_id,
             "base_url": base_url,
             "generate_kwargs": {
@@ -267,6 +271,7 @@ async def main_async(args):
     config = create_config(
         model_id=args.model,
         base_url=args.base_url,
+        local=args.local,
         api_key=api_key,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
