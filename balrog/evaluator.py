@@ -242,6 +242,63 @@ class Evaluator:
         self.dataset = InContextDataset(self.config, self.env_name, original_cwd=original_cwd)
 
     def run_episode(self, task, agent, process_num=None, position=0, episode_idx=0):
+        """Run a single evaluation episode, optionally using trajectory-level best-of-N.
+
+        When `config.eval.best_of_n_trajectories > 1`, this method will run multiple
+        full trajectories for the same (env, task, episode_idx), and return the
+        episode log corresponding to the best trajectory according to the
+        `progression` metric (falling back to `episode_return` if needed).
+        """
+        # Number of independent trajectories to run per logical episode
+        bo_n = getattr(self.config.eval, "best_of_n_trajectories", 1)
+
+        # Backwards-compatible path: no best-of-N, just run a single trajectory
+        if bo_n <= 1:
+            return self._run_single_episode(
+                task,
+                agent,
+                process_num=process_num,
+                position=position,
+                episode_idx=episode_idx,
+                candidate_idx=0,
+                num_candidates=1,
+            )
+
+        best_log = None
+        best_score = float("-inf")
+
+        for candidate_idx in range(bo_n):
+            episode_log = self._run_single_episode(
+                task,
+                agent,
+                process_num=process_num,
+                position=position,
+                episode_idx=episode_idx,
+                candidate_idx=candidate_idx,
+                num_candidates=bo_n,
+            )
+
+            # Prefer progression when available, otherwise fall back to episode_return
+            score = episode_log.get("progression")
+            if score is None:
+                score = episode_log.get("episode_return", 0.0)
+
+            if score > best_score:
+                best_score = score
+                best_log = episode_log
+
+        return best_log
+
+    def _run_single_episode(
+        self,
+        task,
+        agent,
+        process_num=None,
+        position=0,
+        episode_idx=0,
+        candidate_idx=0,
+        num_candidates=1,
+    ):
         """Run a single evaluation episode.
 
         Args:
@@ -259,12 +316,17 @@ class Evaluator:
 
         seed = self.config.envs.env_kwargs.seed
         if seed is None:
-            seed = get_unique_seed(process_num=process_num, episode_idx=episode_idx)
+            # Incorporate candidate index so each best-of-N trajectory gets a unique seed
+            combined_episode_idx = episode_idx * max(num_candidates, 1) + candidate_idx
+            seed = get_unique_seed(process_num=process_num, episode_idx=combined_episode_idx)
         random.seed(seed)
         np.random.seed(seed)
         obs, info = env.reset(seed=seed)
         episode_log = {
             "task": task,
+            "episode_idx": episode_idx,
+            "candidate_idx": candidate_idx,
+            "num_candidates": num_candidates,
             "action_frequency": defaultdict(int),
             "input_tokens": 0,
             "output_tokens": 0,

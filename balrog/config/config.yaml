@@ -23,6 +23,7 @@ eval:
   save_images: False            # Whether to save images from the environment
   icl_episodes: 1
   icl_dataset: records
+  best_of_n_trajectories: 1     # Number of full trajectories to run per episode and pick the best; 1 disables best-of-N
   feedback_on_invalid_action : True       # Whether to provide feedback on invalid actions
 
 client:

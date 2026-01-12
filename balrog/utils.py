@@ -48,10 +48,40 @@ def collect_and_summarize_results(output_dir):
         env_total_steps = 0
         env_total_input_tokens = 0
         env_total_output_tokens = 0
-        env_total_episodes = len(episodes)
         env_tasks = defaultdict(list)
 
-        for episode_log in episodes:
+        # If logs contain best-of-N metadata, collapse multiple candidate trajectories
+        # for the same logical episode into a single "best" episode.
+        use_candidate_grouping = any(
+            ("candidate_idx" in ep and "episode_idx" in ep) for ep in episodes
+        )
+
+        if use_candidate_grouping:
+            episodes_by_group = defaultdict(list)
+            for episode_log in episodes:
+                task_name = episode_log.get("task")
+                episode_idx = episode_log.get("episode_idx")
+                key = (task_name, episode_idx)
+                episodes_by_group[key].append(episode_log)
+
+            grouped_episodes = []
+            for _, group_episodes in episodes_by_group.items():
+                # Prefer progression when available, otherwise fall back to episode_return
+                def _score(ep):
+                    if "progression" in ep:
+                        return ep["progression"]
+                    return ep.get("episode_return", 0.0)
+
+                best_episode = max(group_episodes, key=_score)
+                grouped_episodes.append(best_episode)
+
+            episodes_to_use = grouped_episodes
+        else:
+            episodes_to_use = episodes
+
+        env_total_episodes = len(episodes_to_use)
+
+        for episode_log in episodes_to_use:
             if not config_collected and "client" in episode_log and "agent" in episode_log:
                 agent_config = episode_log["agent"]
                 client_config = episode_log["client"]
